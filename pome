@@ -1,0 +1,212 @@
+#!/usr/bin/env python3
+import yaml
+import abc
+import re
+import sys
+import os
+import copy
+ARGV=sys.argv[1:]
+
+def indent(string):
+  return "  " + string.replace("\n", "\n  ")
+
+def index(arr, v):
+    try:
+        return arr.index(v)
+    except ValueError:
+        return None
+
+class YAML:
+    @staticmethod
+    def load_file(config_path: str) -> dict:
+        with open(config_path, mode="r", encoding="utf-8") as file:
+            return yaml.load(file, Loader=yaml.Loader)
+
+class Job(abc.ABC):
+    @abc.abstractmethod
+    def process(self, config):
+        pass
+
+class JobQueue:
+    def __init__(self, queue):
+        self.queue = queue
+
+    def process(self, config):
+        for j in self.queue:
+            config = j.process(config)
+        return config
+
+class LoadConfigJob(Job):
+    def process(self, config_path):
+        if config_path is None:
+            raise Exception("must pass a valid config_path")
+        return YAML.load_file(config_path)
+
+class ProcessOptionsJob(Job):
+    def process(self, config):
+        self.config = config
+        self.initialize_options()
+        self.validate_by_enum("sep", [".", "-", ":"], ".")
+        return self.config
+
+    def initialize_options(self):
+        if self.config.get("options") is None:
+            self.config["options"] = {}
+
+    def validate_by_enum(self, key, choices, default):
+        if self.config["options"].get(key) is None:
+            self.config["options"][key] = default
+        else:
+            if not (self.config["options"][key] in choices):
+                raise Exception(f"Invalid options:key value {self.config['options'][key]}, expeact one of {choices}")
+
+class AssignNamesJob(Job):
+    def process(self, config):
+        self.options = config["options"]
+        config["units"] = self.assign_names(config["units"])
+        return config
+
+    def assign_names(self, unit, namespace = None):
+        for k in unit.keys():
+            if not re.match(r".*%", k):
+                if isinstance(unit[k], dict):
+                    unit[k]["name%"] = self.scoped_name(namespace, k)
+                    unit[k] = self.assign_names(unit[k], unit[k]["name%"])
+        return unit
+    def scoped_name(self, namespace, name):
+        if namespace is None:
+            return name
+        else:
+            return self.options["sep"].join([namespace, name])
+
+class AssignPathsJob(Job):
+    def process(self, config):
+        self.options = config["options"]
+        config["units"] = self.assign_paths(config["units"])
+        return config
+
+    def assign_paths(self, unit, parent_path = None):
+        for k in unit.keys():
+            if  isinstance(unit[k],dict):
+                if unit[k]["path%"] is None:
+                    if not parent_path is None:
+                        unit[k]["path%"] = parent_path
+                else:
+                    unit[k]["path%"] = self.scoped_path(parent_path, unit[k]["path%"])
+                    unit[k] = self.assign_paths(unit[k], unit[k]["path%"])
+            elif isinstance(unit[k],str):
+                if not re.match(r"^.*%$",k):
+                    unit[k] = {
+                        "cmnd%": unit[k]
+                    }
+                    if not parent_path is None:
+                        unit[k]["path%"] = parent_path
+            elif unit[k] is None:
+                unit[k] = {"path%": parent_path}
+        return unit
+
+    def scoped_path(self, parent_path, path):
+        if parent_path is None:
+            return path
+        else:
+            return os.path.join(parent_path, path)
+
+class ProcessLinksJob(Job):
+    def process(self, config):
+        self.config = config
+        self.process_links(config["units"])
+        return self.config
+
+    def process_links(self, unit):
+        for k in unit.keys():
+            if not re.match(".*%", k):
+                if  isinstance(unit[k],str):
+                    if self.is_link(unit[k]):
+                        unit[k] = self.resolve(self.extract_link(unit[k]))
+                elif  isinstance(unit[k],dict):
+                    unit[k] = self.process_links(unit[k])
+        return unit
+
+    def is_link(self, string):
+        return re.match(r"^\$\((.*)\)$", string)
+
+    def extract_link(self, string):
+        return re.match(r"^\$\((.*)\)$", string)[1].split(".")
+
+    def resolve(self, ids):
+        if ids == []:
+            raise Exception("unable to resolve empty path")
+        context = self.config["units"]
+        for id in ids:
+            if context[id] is None:
+                raise Exception(f"context {context.to_yaml} has no child {id}")
+            context = context[id]
+        return copy.copy(context)
+
+class BuildFunctionsJob(Job):
+    def process(self, config):
+        self.config = config
+        self.build_functions(config["units"])
+        return self.config
+
+    def build_functions(self, unit):
+        for k in unit.keys():
+            if not re.match(".*%", k):
+                if isinstance(unit[k],dict):
+                    if not unit[k].get("name%") is None:
+                        name = unit[k]["name%"]
+                        print("function %s {" % name)
+                        if not unit[k].get("path%") is None:
+                            path = unit[k]["path%"]
+                            print(indent("cd %s" % path))
+                        if not unit[k].get("cmnd%") is None:
+                            print(indent(unit[k]["cmnd%"]))
+                        print("}")
+                    unit[k] = self.build_functions(unit[k])
+        return unit
+
+class CLI:
+    def __init__(self):
+        self.args = ARGV
+    def help(self):
+        return (("--help" in self.args) or
+                ("-h" in self.args))
+
+
+    def dry_run(self):
+        return (("--dry-run" in self.args) or
+                ("-d" in self.args))
+
+
+    def file(self):
+        i = (index(self.args, "--file") or
+             index(self.args, "-f"))
+        result = "Somefile" 
+        if not i is None:
+            result = self.args[i+1]
+        return result
+
+cli = CLI()
+
+if cli.help():
+  print("pome [-h -d -f <file>]")
+  print("-------------------------")
+  print("-h/--help:    Help Screen")
+  print("-d/--dry-run: Dry Run")
+  print("-f/--file:    Input File")
+  exit(0)
+
+queue = [
+  LoadConfigJob(),
+  ProcessOptionsJob(),
+  ProcessLinksJob(),
+  AssignPathsJob(),
+  AssignNamesJob(),
+]
+
+if not cli.dry_run():
+    queue.append(BuildFunctionsJob()) 
+
+config = JobQueue(queue).process(cli.file())
+if cli.dry_run():
+    print(config.to_yaml)
