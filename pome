@@ -88,7 +88,7 @@ class AssignPathsJob(Job):
     def assign_paths(self, unit, parent_path = None):
         for k in unit.keys():
             if  isinstance(unit[k],dict):
-                if unit[k]["path%"] is None:
+                if unit[k].get("path%") is None:
                     if not parent_path is None:
                         unit[k]["path%"] = parent_path
                 else:
